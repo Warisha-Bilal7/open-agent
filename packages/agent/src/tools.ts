@@ -1,4 +1,5 @@
 import type { PermissionLevel, ToolCall, ToolDefinition, ToolExecutionContext, ToolResult } from './types.js'
+import { fenceUntrusted } from './untrusted.js'
 
 /** How long an approval lasts. */
 export type ApprovalScope = 'once' | 'task' | 'session'
@@ -76,6 +77,8 @@ export class ToolRegistry {
   private isUnattended: (taskId: string) => boolean = () => false
   /** Remembered approvals, keyed by tool and (for `exact` grants) arguments. */
   private readonly grants = new Map<string, ApprovalGrant>()
+  /** Tasks that have read output from an `untrustedOutput` tool. */
+  private readonly tainted = new Set<string>()
   readonly auditLog: Array<{
     call: ToolCall
     permissionLevel: PermissionLevel
@@ -147,7 +150,20 @@ export class ToolRegistry {
     // A `dangerous` call is never covered by a remembered approval, and its
     // answer is never remembered. The whole point of the level is that each
     // one is looked at; a grant would quietly undo that.
-    if (tool.permissionLevel !== 'dangerous' && !this.isUnattended(taskId) && this.findGrant(call, taskId)) {
+    //
+    // Nor is any call from a task that has read untrusted content. The user
+    // who said "always allow" was deciding about calls *they* would cause; once
+    // a web page has had its say, the next call may be the page's idea. Asking
+    // again is how untrusted content is kept from borrowing the user's standing
+    // approval — the same threshold holds, it just cannot be pre-paid. The
+    // same goes for an unattended task (see `setUnattended`), which nobody is
+    // watching to have granted anything to.
+    if (
+      tool.permissionLevel !== 'dangerous' &&
+      !this.tainted.has(taskId) &&
+      !this.isUnattended(taskId) &&
+      this.findGrant(call, taskId)
+    ) {
       return 'remembered'
     }
 
@@ -169,6 +185,19 @@ export class ToolRegistry {
       })
     }
     return 'granted'
+  }
+
+  /** Whether a task has read output from a tool marked `untrustedOutput`. */
+  isTainted(taskId: string): boolean {
+    return this.tainted.has(taskId)
+  }
+
+  /**
+   * Marks a task as having read untrusted content without running a tool —
+   * for a task resumed with that content already in its history.
+   */
+  taint(taskId: string): void {
+    this.tainted.add(taskId)
   }
 
   /** What is currently remembered, so a user can see what will not prompt again. */
@@ -193,6 +222,7 @@ export class ToolRegistry {
    * session-scoped one the user never agreed to.
    */
   endTask(taskId: string): void {
+    this.tainted.delete(taskId)
     for (const [key, grant] of this.grants) {
       if (grant.scope === 'task' && grant.taskId === taskId) this.grants.delete(key)
     }
@@ -230,6 +260,21 @@ export class ToolRegistry {
       result = { ok: false, content: '', error: err instanceof Error ? err.message : String(err) }
     }
     this.auditLog.push({ call, permissionLevel: tool.permissionLevel, approved: true, approvalSource, result })
-    return result
+    if (!tool.untrustedOutput) return result
+
+    // Fenced here, where it is known the tool itself produced the text, and
+    // not for the registry's own refusals above: those are the user's
+    // decisions, and fencing one would tell the model to treat it as outside
+    // data. Tainted whatever the outcome — an error can carry the remote
+    // side's text just as well as a success can. The audit log keeps the raw
+    // output.
+    this.tainted.add(context.taskId)
+    return fenceResult(result, call.name)
   }
+}
+
+/** Fences whichever part of a result carries the remote side's text. */
+function fenceResult(result: ToolResult, source: string): ToolResult {
+  if (result.ok) return { ...result, content: fenceUntrusted(result.content, source) }
+  return result.error === undefined ? result : { ...result, error: fenceUntrusted(result.error, source) }
 }
