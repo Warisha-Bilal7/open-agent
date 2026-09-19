@@ -103,6 +103,76 @@ describe('resolveCredential', () => {
   })
 })
 
+describe('resolveCredential with a secret store', () => {
+  const store = (secrets: Record<string, string>, name = 'keychain') => ({
+    name,
+    get: (key: string) => secrets[key],
+  })
+
+  it('falls back to the store when neither the variable nor its _FILE is set', () => {
+    const result = resolveCredential('OPENAI_API_KEY', { env: {}, store: store({ OPENAI_API_KEY: 'sk-stored' }) })
+    expect(result).toEqual({ ok: true, value: 'sk-stored', source: 'OPENAI_API_KEY in the keychain' })
+  })
+
+  it('lets the environment override the store', () => {
+    const lookup = { env: { OPENAI_API_KEY: 'sk-env' }, store: store({ OPENAI_API_KEY: 'sk-stored' }) }
+    expect(resolveCredential('OPENAI_API_KEY', lookup)).toMatchObject({ ok: true, value: 'sk-env' })
+  })
+
+  it('checks every name in the environment before asking the store about any', () => {
+    const asked: string[] = []
+    const recording = {
+      name: 'keychain',
+      get: (key: string) => (asked.push(key), key === 'OPENROUTER_API_KEY' ? 'sk-stale' : undefined),
+    }
+    const lookup = { env: { OPENAI_API_KEY: 'sk-env' }, store: recording }
+    expect(resolveCredential(['OPENROUTER_API_KEY', 'OPENAI_API_KEY'], lookup)).toMatchObject({ value: 'sk-env' })
+    expect(asked).toEqual([])
+  })
+
+  it('does not fail on an unreachable store when a later name is in the environment', () => {
+    const broken = {
+      name: 'keychain',
+      get: () => {
+        throw new Error('Cannot autolaunch D-Bus')
+      },
+    }
+    const lookup = { env: { OPENAI_API_KEY: 'sk-env' }, store: broken }
+    expect(resolveCredential(['OPENROUTER_API_KEY', 'OPENAI_API_KEY'], lookup)).toMatchObject({ ok: true })
+  })
+
+  it('asks the store for each name in order once the environment has none', () => {
+    const lookup = { env: {}, store: store({ OPENAI_API_KEY: 'sk-generic', OPENROUTER_API_KEY: 'sk-vendor' }) }
+    expect(resolveCredential(['OPENROUTER_API_KEY', 'OPENAI_API_KEY'], lookup)).toMatchObject({ value: 'sk-vendor' })
+  })
+
+  it('validates a stored value like any other', () => {
+    const result = resolveCredential('K', { env: {}, store: store({ K: 'two words' }) })
+    expect(result).toMatchObject({ ok: false, reason: 'malformed' })
+    if (!result.ok) expect(result.error).not.toContain('two words')
+  })
+
+  it('reports a store that cannot be read, rather than treating it as missing', () => {
+    const broken = {
+      name: 'keychain',
+      get: () => {
+        throw new Error('secret-tool was not found')
+      },
+    }
+    expect(resolveCredential('K', { env: {}, store: broken })).toEqual({
+      ok: false,
+      reason: 'unreadable',
+      error: 'K could not be read from the keychain: secret-tool was not found',
+    })
+  })
+
+  it('mentions the store in the missing-credential error', () => {
+    const result = resolveCredential('K', { env: {}, store: store({}) })
+    expect(result).toMatchObject({ ok: false, reason: 'missing' })
+    if (!result.ok) expect(result.error).toContain('or store it in the keychain under K')
+  })
+})
+
 describe('apiKeyVarsFor', () => {
   it.each([
     ['https://openrouter.ai/api/v1', ['OPENROUTER_API_KEY', 'OPENAI_API_KEY']],
