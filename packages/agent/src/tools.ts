@@ -1,5 +1,20 @@
-import type { PermissionLevel, ToolCall, ToolDefinition, ToolExecutionContext, ToolResult } from './types.js'
+import type {
+  PermissionLevel,
+  SessionEvent,
+  ToolCall,
+  ToolDefinition,
+  ToolExecutionContext,
+  ToolResult,
+} from './types.js'
 import { fenceUntrusted } from './untrusted.js'
+import {
+  destinationsIn,
+  destinationsInText,
+  detectExfiltration,
+  newTaskActivity,
+  type Escalation,
+  type TaskActivity,
+} from './dangerous-actions.js'
 
 /** How long an approval lasts. */
 export type ApprovalScope = 'once' | 'task' | 'session'
@@ -26,6 +41,13 @@ export interface ApprovalDecision {
 /** Which run a call belongs to, for a handler that answers differently per task. */
 export interface ApprovalContext {
   taskId: string
+  /**
+   * Set when a sequence rule put this call up for approval rather than its own
+   * permission level — see `dangerous-actions.ts`. A handler should show the
+   * reason: the user is being asked about a `safe` call, and without it the
+   * prompt is inexplicable.
+   */
+  escalation?: Escalation
 }
 
 /**
@@ -79,10 +101,14 @@ export class ToolRegistry {
   private readonly grants = new Map<string, ApprovalGrant>()
   /** Tasks that have read output from an `untrustedOutput` tool. */
   private readonly tainted = new Set<string>()
+  /** What each live task has read and where it has already been, for the sequence rules. */
+  private readonly activity = new Map<string, TaskActivity>()
   readonly auditLog: Array<{
     call: ToolCall
     permissionLevel: PermissionLevel
     approved: boolean
+    /** The sequence rule that forced this call to be asked about, if one did. */
+    escalation?: Escalation
     /**
      * Whether a human answered for this call or a previous answer covered it.
      * Without the distinction the log says "approved" for a call nobody saw,
@@ -143,9 +169,74 @@ export class ToolRegistry {
     return undefined
   }
 
-  private async decide(call: ToolCall, tool: ToolDefinition, taskId: string): Promise<ApprovalSource> {
-    if (tool.permissionLevel === 'safe') return 'safe'
-    if (tool.permissionLevel === 'dangerous' && !this.enabledDangerous.has(tool.name)) return 'denied'
+  /** The sequence-rule state for a task, created on first use. */
+  private activityFor(taskId: string): TaskActivity {
+    let state = this.activity.get(taskId)
+    if (!state) {
+      state = newTaskActivity()
+      this.activity.set(taskId, state)
+    }
+    return state
+  }
+
+  /**
+   * Tells the rules what the user actually asked for, so a destination they
+   * named themselves does not prompt. Called by the agent loop with each user
+   * message, and so re-derived from the session log on a resumed task.
+   */
+  noteUserRequest(taskId: string, text: string): void {
+    const state = this.activityFor(taskId)
+    for (const host of destinationsInText(text)) state.known.add(host)
+  }
+
+  /**
+   * Rebuilds a task's sequence-rule state from its session log.
+   *
+   * `endTask` drops that state, but the conversation keeps every word of it: a
+   * follow-up turn, or a session resumed in a new process, has read what the
+   * earlier turns read. Without this the rule would be escapable by simply
+   * waiting for the turn to end — read the file in one turn, send it in the
+   * next — which is no barrier at all. The same replay restores the
+   * destinations already reached, so a host used honestly last turn does not
+   * start prompting this turn.
+   */
+  replayTask(taskId: string, events: readonly SessionEvent[]): void {
+    const state = this.activityFor(taskId)
+    const pending = new Map<string, ToolCall>()
+    for (const event of events) {
+      if (event.type === 'user/message') {
+        for (const host of destinationsInText(event.message.content)) state.known.add(host)
+        continue
+      }
+      if (event.type === 'tool/call') {
+        pending.set(event.call.id, event.call)
+        continue
+      }
+      if (event.type !== 'tool/result') continue
+      const call = pending.get(event.callId)
+      if (call === undefined) continue
+      // Only a call that succeeded settles its destination. The log holds a
+      // `tool/call` for refused calls too, and replaying those would hand a
+      // task the one thing the user just denied it: read the page, be refused
+      // the send, and have the destination waved through next turn.
+      if (event.result.ok) {
+        for (const host of destinationsIn(call.args)) state.known.add(host)
+      }
+      if (event.result.content || event.result.error) state.ingested.add(call.name)
+    }
+  }
+
+  private async decide(
+    call: ToolCall,
+    tool: ToolDefinition,
+    taskId: string,
+  ): Promise<{ source: ApprovalSource; escalation?: Escalation }> {
+    // Before the permission level, because the whole point is a call whose own
+    // level would have let it through unexamined.
+    const escalation = detectExfiltration(call, this.activityFor(taskId))
+
+    if (tool.permissionLevel === 'safe' && !escalation) return { source: 'safe' }
+    if (tool.permissionLevel === 'dangerous' && !this.enabledDangerous.has(tool.name)) return { source: 'denied' }
 
     // A `dangerous` call is never covered by a remembered approval, and its
     // answer is never remembered. The whole point of the level is that each
@@ -158,24 +249,32 @@ export class ToolRegistry {
     // approval — the same threshold holds, it just cannot be pre-paid. The
     // same goes for an unattended task (see `setUnattended`), which nobody is
     // watching to have granted anything to.
+    //
+    // Nor is an escalated one. A rule fires precisely when this call is unlike
+    // the ones the user was answering about when they said "always", so
+    // spending that grant here would let the rule be silenced by an approval
+    // given before there was anything to detect.
     if (
       tool.permissionLevel !== 'dangerous' &&
+      !escalation &&
       !this.tainted.has(taskId) &&
       !this.isUnattended(taskId) &&
       this.findGrant(call, taskId)
     ) {
-      return 'remembered'
+      return { source: 'remembered' }
     }
 
-    const decision = await this.approvalHandler(call, tool, { taskId })
+    const decision = await this.approvalHandler(call, tool, { taskId, escalation })
     const {
       approved,
       scope = 'once',
       match = 'exact',
     } = typeof decision === 'boolean' ? { approved: decision } : decision
-    if (!approved) return 'denied'
+    if (!approved) return { source: 'denied', escalation }
 
-    if (scope !== 'once' && tool.permissionLevel !== 'dangerous') {
+    // An escalated call is approved for this once and no further. Remembering
+    // it would remember the rule's own trigger away.
+    if (scope !== 'once' && !escalation && tool.permissionLevel !== 'dangerous') {
       this.grants.set(this.grantKey(call.name, match, call.args), {
         tool: call.name,
         match,
@@ -184,7 +283,7 @@ export class ToolRegistry {
         args: match === 'exact' ? call.args : undefined,
       })
     }
-    return 'granted'
+    return { source: 'granted', escalation }
   }
 
   /** Whether a task has read output from a tool marked `untrustedOutput`. */
@@ -223,6 +322,7 @@ export class ToolRegistry {
    */
   endTask(taskId: string): void {
     this.tainted.delete(taskId)
+    this.activity.delete(taskId)
     for (const [key, grant] of this.grants) {
       if (grant.scope === 'task' && grant.taskId === taskId) this.grants.delete(key)
     }
@@ -236,18 +336,21 @@ export class ToolRegistry {
       return result
     }
 
-    const approvalSource = await this.decide(call, tool, context.taskId)
+    const { source: approvalSource, escalation } = await this.decide(call, tool, context.taskId)
     if (approvalSource === 'denied') {
       const result: ToolResult = {
         ok: false,
         content: '',
-        error: `tool "${call.name}" requires approval and was not approved`,
+        error: escalation
+          ? `tool "${call.name}" was not approved: ${escalation.reason}`
+          : `tool "${call.name}" requires approval and was not approved`,
       }
       this.auditLog.push({
         call,
         permissionLevel: tool.permissionLevel,
         approved: false,
         approvalSource,
+        escalation,
         result,
       })
       return result
@@ -259,7 +362,28 @@ export class ToolRegistry {
     } catch (err) {
       result = { ok: false, content: '', error: err instanceof Error ? err.message : String(err) }
     }
-    this.auditLog.push({ call, permissionLevel: tool.permissionLevel, approved: true, approvalSource, result })
+    this.auditLog.push({
+      call,
+      permissionLevel: tool.permissionLevel,
+      approved: true,
+      approvalSource,
+      escalation,
+      result,
+    })
+
+    // Only a call that has actually run and succeeded settles its destination:
+    // one the user refused must never become one the rules consider settled,
+    // and a failed call is not evidence the destination was reached. This
+    // matches what `replayTask` can reconstruct from the log, where a refusal
+    // and a failure look alike, so the same task judges the same either way.
+    const activity = this.activityFor(context.taskId)
+    if (result.ok) {
+      for (const host of destinationsIn(call.args)) activity.known.add(host)
+    }
+    // Content coming back is what there is to exfiltrate later. An error body
+    // counts — it carries the far side's text as readily as a success does.
+    if (result.content || result.error) activity.ingested.add(call.name)
+
     if (!tool.untrustedOutput) return result
 
     // Fenced here, where it is known the tool itself produced the text, and

@@ -104,6 +104,11 @@ export class AgentLoop {
     // turn, or a session resumed in a new process — has read it all the same.
     if (sessions.all(taskId).some((e) => e.type === 'tool/result' && isFenced(e.result))) tools.taint(taskId)
 
+    // Same reasoning for the sequence rules: what the task has already read,
+    // and which destinations are unremarkable by now, are facts about the
+    // conversation rather than about one turn of it.
+    tools.replayTask(taskId, sessions.all(taskId))
+
     try {
       for (let step = 0; step < this.maxSteps; step++) {
         if (signal.aborted) throw new CancelledError()
